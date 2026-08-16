@@ -64,6 +64,18 @@ Extra (optional)
     * ``allow_redirects``
     * ``max_redirects``
 
+    SRV DNS resolution
+    ------------------
+
+    Set ``"srv": true`` in the Extra field to resolve the Host via an SRV DNS record.
+    This is useful for service discovery setups such as AWS Cloud Map with ECS dynamic
+    port mapping. Put the SRV record name in Host (for example
+    ``_http._tcp.my-service.local``) and leave Port empty.
+
+    Optional SRV-related extra fields:
+
+    * ``srv_timeout`` - DNS lookup timeout in seconds (default: ``5``)
+    * ``srv_failover`` - if ``true``, retry with the next SRV target on connection failure
 
 When specifying the connection in environment variable you should specify
 it using URI syntax.

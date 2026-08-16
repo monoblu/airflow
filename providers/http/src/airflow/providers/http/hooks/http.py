@@ -21,7 +21,7 @@ import copy
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import tenacity
@@ -36,6 +36,7 @@ from tenacity import retry_if_exception
 
 from airflow.providers.common.compat.sdk import AirflowException, BaseHook
 from airflow.providers.http.exceptions import HttpErrorException, HttpMethodException
+from airflow.providers.http.utils.srv import resolve_http_connection_endpoint
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 if TYPE_CHECKING:
@@ -43,6 +44,24 @@ if TYPE_CHECKING:
     from requests.adapters import HTTPAdapter
 
     from airflow.models import Connection
+
+
+def _replace_url_host_port(url: str, host: str, port: int | None) -> str:
+    """Replace the host and port in a URL."""
+    parsed = urlparse(url)
+    netloc = f"{host}:{port}" if port else host
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _build_base_url(schema: str, host: str, port: int | None) -> str:
+    """Build a base URL from schema, host, and port."""
+    if "://" in host:
+        base_url = host
+    else:
+        base_url = f"{schema}://{host}" if host else f"{schema}://"
+    if port:
+        base_url = f"{base_url}:{port}"
+    return base_url
 
 
 def _url_from_endpoint(base_url: str | None, endpoint: str | None) -> str:
@@ -75,6 +94,9 @@ def _process_extra_options_from_connection(
     max_redirects = conn_extra_options.pop("max_redirects", None)
     trust_env = conn_extra_options.pop("trust_env", None)
     check_response = conn_extra_options.pop("check_response", None)
+    conn_extra_options.pop("srv", None)
+    conn_extra_options.pop("srv_timeout", None)
+    conn_extra_options.pop("srv_failover", None)
 
     if stream is not None and "stream" not in passed_extra_options:
         passed_extra_options["stream"] = stream
@@ -175,6 +197,7 @@ class HttpHook(BaseHook):
             self.keep_alive_adapter = None
 
         self.merged_extra: dict = {}
+        self._srv_failover_targets: list[tuple[str, int]] = []
 
     @property
     def auth_type(self):
@@ -216,15 +239,11 @@ class HttpHook(BaseHook):
         return session
 
     def _set_base_url(self, connection) -> None:
-        host = connection.host or self.default_host
+        host, port, self._srv_failover_targets = resolve_http_connection_endpoint(
+            connection, default_host=self.default_host
+        )
         schema = connection.schema or "http"
-        # RFC 3986 (https://www.rfc-editor.org/rfc/rfc3986.html#page-16)
-        if "://" in host:
-            self.base_url = host
-        else:
-            self.base_url = f"{schema}://{host}" if host else f"{schema}://"
-        if connection.port:
-            self.base_url = f"{self.base_url}:{connection.port}"
+        self.base_url = _build_base_url(schema, host, port)
         parsed = urlparse(self.base_url)
         if not parsed.scheme:
             raise ValueError(f"Invalid base URL: Missing scheme in {self.base_url}")
@@ -377,6 +396,17 @@ class HttpHook(BaseHook):
             return response
 
         except ConnectionError as ex:
+            if self._srv_failover_targets:
+                host, port = self._srv_failover_targets.pop(0)
+                schema = urlparse(self.base_url).scheme or "http"
+                self.base_url = _build_base_url(schema, host, port)
+                prepped_request.url = _replace_url_host_port(prepped_request.url, host, port)
+                self.log.warning(
+                    "Connection failed, retrying with next SRV target: %s:%s",
+                    host,
+                    port,
+                )
+                return self.run_and_check(session, prepped_request, extra_options)
             self.log.warning("%s Tenacity will retry to execute the operation", ex)
             raise ex
 
@@ -617,14 +647,12 @@ class HttpAsyncHook(BaseHook):
             if self.http_conn_id:
                 conn = await get_async_connection(conn_id=self.http_conn_id)
 
-                if conn.host and "://" in conn.host:
-                    base_url = conn.host
+                host, port, _ = resolve_http_connection_endpoint(conn)
+                if host and "://" in host:
+                    base_url = host
                 else:
                     schema = conn.schema or "http"
-                    base_url = f"{schema}://{conn.host or ''}"
-
-                if conn.port:
-                    base_url += f":{conn.port}"
+                    base_url = _build_base_url(schema, host, port)
 
                 if conn.login:
                     auth = self.auth_type(conn.login, conn.password)

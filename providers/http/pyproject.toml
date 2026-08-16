@@ -68,6 +68,7 @@ dependencies = [
     "aiohttp>=3.12.14",
     "asgiref>=2.3.0; python_version < '3.14'",
     "asgiref>=3.11.1; python_version >= '3.14'",
+    "dnspython>=1.13.0",
 ]
 
 [dependency-groups]
